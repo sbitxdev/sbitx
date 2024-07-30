@@ -68,6 +68,7 @@ fftw_complex *fft_m;			// holds previous samples for overlap and discard convolu
 fftw_plan plan_fwd, plan_tx;
 int bfo_freq = 40035000;
 int freq_hdr = -1;
+int si570_xtal = 0;
 
 static double volume 	= 100.0;
 static int tx_drive = 40;
@@ -79,7 +80,7 @@ static double spectrum_speed = 0.3;
 static int in_tx = 0;
 static int rx_tx_ramp = 0;
 static int sidetone = 2000000000;
-struct vfo tone_a, tone_b; //these are audio tone generators
+struct vfo tone_a, tone_b, am_carrier; //these are audio tone generators
 static int tx_use_line = 0;
 struct rx *rx_list = NULL;
 struct rx *tx_list = NULL;
@@ -89,8 +90,10 @@ static double alc_level = 1.0;
 static int tr_relay = 0;
 static int rx_pitch = 700; //used only to offset the lo for CW,CWR
 static int bridge_compensation = 100;
-static double voice_clip_level = 0.022;
+static double voice_clip_level = 0.04;
 static int in_calibration = 1; // this turns off alc, clipping et al
+
+static int multicast_socket = -1;
 
 #define MUTE_MAX 6 
 static int mute_count = 50;
@@ -236,6 +239,46 @@ void spectrum_update(){
 		spectrum_plot[i] = y;
 	}
 }
+/*
+static int create_mcast_socket(){
+    int sockfd;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    char buffer[MAX_BUFFER_SIZE];
+
+    // Create a UDP socket
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+        perror("Error creating mcast socket");
+				return -1;
+    }
+
+    // Set up the server address structure
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(MULTICAST_PORT);
+
+    // Bind the socket to the server address
+    if (bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+        perror("Error binding mcast socket");
+        close(sockfd);
+				return -1;
+    }
+
+    // Set up the multicast group membership
+    struct ip_mreq mreq;
+    inet_pton(AF_INET, MULTICAST_ADDR, &(mreq.imr_multiaddr.s_addr));
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    if (setsockopt(sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) == -1) {
+        perror("Error adding multicast group membership");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Listening for multicast on  %s:%d...\n", MULTICAST_ADDR, PORT);
+		return socketfd;
+}
+*/
 
 int remote_audio_output(int16_t *samples){
 	int length = q_length(&qremote);
@@ -371,7 +414,7 @@ void tx_init(int frequency, short mode, int bpf_low, int bpf_high){
 	//the tuning can go up and down only by 22 KHz from the center_freq
 
 	tx_filter = filter_new(1024, 1025);
-	filter_tune(tx_filter, (1.0 * bpf_low)/96000.0, (1.0 * bpf_high)/96000.0 , 5);
+//	filter_tune(tx_filter, (1.0 * bpf_low)/96000.0, (1.0 * bpf_high)/96000.0 , 5);
 }
 
 struct rx *add_tx(int frequency, short mode, int bpf_low, int bpf_high){
@@ -510,28 +553,21 @@ double agc2(struct rx *r){
 		r->agc_gain = agc_gain_should_be;
 		//reset the agc to hang count down 
     r->agc_loop = r->agc_speed;
-//  	printf("attack %g %d ", r->agc_gain, r->agc_loop);
   }
 	else if (r->agc_loop <= 0){
 		agc_ramp = (agc_gain_should_be - r->agc_gain) / (MAX_BINS/2);	
-//  	printf("release %g %d ",  r->agc_gain, r->agc_loop);
 	}
-//	else if (r->agc_loop > 0)
-//  	printf("hanging %g %d ", r->agc_gain, r->agc_loop);
  
 	if (agc_ramp != 0){
-//		printf("Ramping from %g ", r->agc_gain);
   	for (i = 0; i < MAX_BINS/2; i++){
 	  	__imag__ (r->fft_time[i+(MAX_BINS/2)]) *= r->agc_gain;
 		}
 		r->agc_gain += agc_ramp;		
-//		printf("by %g to %g ", agc_ramp, r->agc_gain);
 	}
 	else 
   	for (i = 0; i < MAX_BINS/2; i++)
 	  	__imag__ (r->fft_time[i+(MAX_BINS/2)]) *= r->agc_gain;
 
-//	printf("\n");
   r->agc_loop--;
 
 	//printf("%d:s meter: %d %d %d \n", count++, (int)r->agc_gain, (int)r->signal_strength, r->agc_loop);
@@ -542,13 +578,100 @@ void my_fftw_execute(fftw_plan f){
 	fftw_execute(f);
 }
 
+static int32_t rx_am_avg = 0;
 
-//TODO : optimize the memory copy and moves to use the memcpy
-void rx_process(int32_t *input_rx,  int32_t *input_mic, 
+void rx_am(int32_t *input_rx,  int32_t *input_mic, 
 	int32_t *output_speaker, int32_t *output_tx, int n_samples)
 {
 	int i, j = 0;
 	double i_sample, q_sample;
+	//STEP 1: first add the previous M samples to
+	for (i = 0; i < MAX_BINS/2; i++)
+		fft_in[i]  = fft_m[i];
+
+	//STEP 2: then add the new set of samples
+	// m is the index into incoming samples, starting at zero
+	// i is the index into the time samples, picking from 
+	// the samples added in the previous step
+	int m = 0;
+	//gather the samples into a time domain array 
+	for (i= MAX_BINS/2; i < MAX_BINS; i++){
+		i_sample = (1.0  *input_rx[j])/200000000.0;
+		q_sample = 0;
+
+		j++;
+
+		__real__ fft_m[m] = i_sample;
+		__imag__ fft_m[m] = q_sample;
+
+		__real__ fft_in[i]  = i_sample;
+		__imag__ fft_in[i]  = q_sample;
+		m++;
+	}
+
+	// STEP 3: convert the time domain samples to  frequency domain
+	my_fftw_execute(plan_fwd);
+
+	//STEP 3B: this is a side line, we use these frequency domain
+	// values to paint the spectrum in the user interface
+	// I discovered that the raw time samples give horrible spectrum
+	// and they need to be multiplied wiht a window function 
+	// they use a separate fft plan
+	// NOTE: the spectrum update has nothing to do with the actual
+	// signal processing. If you are not showing the spectrum or the
+	// waterfall, you can skip these steps
+	for (i = 0; i < MAX_BINS; i++)
+		__real__ fft_in[i] *= spectrum_window[i];
+	my_fftw_execute(plan_spectrum);
+
+	// the spectrum display is updated
+	spectrum_update();
+	
+	struct rx *r = rx_list;
+
+	//STEP 4: we rotate the bins around by r-tuned_bin
+	for (i = 0; i < MAX_BINS; i++){
+		int b =  i + r->tuned_bin;
+		if (b >= MAX_BINS)
+			b = b - MAX_BINS;
+		if (b < 0)
+			b = b + MAX_BINS;
+		r->fft_freq[i] = fft_out[b]; 
+//		r->fft_freq[i] = fft_out[i];
+	}
+
+	// STEP 6: apply the filter to the signal,
+	// in frequency domain we just multiply the filter
+	// coefficients with the frequency domain samples
+	for (i = 0; i < MAX_BINS; i++)
+		r->fft_freq[i] *= r->filter->fir_coeff[i];
+
+	//STEP 7: convert back to time domain	
+	my_fftw_execute(r->plan_rev);
+	//STEP 8 : AGC
+	agc2(r);
+
+	//do an independent am detection (this takes 12 khz of b/w)
+	for (i= MAX_BINS/2; i < MAX_BINS; i++){
+		int32_t sample;
+		sample = abs(r->fft_time[i]) * 1000000;
+		rx_am_avg = (rx_am_avg* 5 + sample)/6;
+		//keep transmit buffer empty
+		output_speaker[i] = sample;
+//		output_speaker[i] = abs(input_rx[i]);
+		output_tx[i] = 0;
+	}
+//	for (i = 0; i < n_samples; i++)
+//		output_speaker[i] = rx_am_avg = ((rx_am_avg * 9) + abs(input_rx[i]))/10;
+}
+
+//TODO : optimize the memory copy and moves to use the memcpy
+void rx_linear(int32_t *input_rx,  int32_t *input_mic, 
+	int32_t *output_speaker, int32_t *output_tx, int n_samples)
+{
+	int i, j = 0;
+	double i_sample, q_sample;
+
 
 	//STEP 1: first add the previous M samples to
 	for (i = 0; i < MAX_BINS/2; i++)
@@ -586,12 +709,11 @@ void rx_process(int32_t *input_rx,  int32_t *input_mic,
 	// signal processing. If you are not showing the spectrum or the
 	// waterfall, you can skip these steps
 	for (i = 0; i < MAX_BINS; i++)
-			__real__ fft_in[i] *= spectrum_window[i];
+		__real__ fft_in[i] *= spectrum_window[i];
 	my_fftw_execute(plan_spectrum);
 
 	// the spectrum display is updated
 	spectrum_update();
-
 
 	// ... back to the actual processing, after spectrum update  
 
@@ -599,10 +721,13 @@ void rx_process(int32_t *input_rx,  int32_t *input_mic,
 	// hence, the linkced list of receivers here
 	// at present, we handle just the first receiver
 	struct rx *r = rx_list;
-	
+
 	//STEP 4: we rotate the bins around by r-tuned_bin
+	int shift = r->tuned_bin;
+	if (r->mode == MODE_AM)
+		shift = 0;
 	for (i = 0; i < MAX_BINS; i++){
-		int b =  i + r->tuned_bin;
+		int b =  i + shift;
 		if (b >= MAX_BINS)
 			b = b - MAX_BINS;
 		if (b < 0)
@@ -610,13 +735,14 @@ void rx_process(int32_t *input_rx,  int32_t *input_mic,
 		r->fft_freq[i] = fft_out[b];
 	}
 
+
 	// STEP 5:zero out the other sideband
 	if (r->mode == MODE_LSB || r->mode == MODE_CWR)
 		for (i = 0; i < MAX_BINS/2; i++){
 			__real__ r->fft_freq[i] = 0;
 			__imag__ r->fft_freq[i] = 0;	
 		}
-	else  
+	else if (r->mode != MODE_AM)  
 		for (i = MAX_BINS/2; i < MAX_BINS; i++){
 			__real__ r->fft_freq[i] = 0;
 			__imag__ r->fft_freq[i] = 0;	
@@ -638,13 +764,22 @@ void rx_process(int32_t *input_rx,  int32_t *input_mic,
 	int is_digital = 0;
 
 	if (rx_list->output == 0){
-		for (i= 0; i < MAX_BINS/2; i++){
-			int32_t sample;
-			sample = cimag(r->fft_time[i+(MAX_BINS/2)]);
-			//keep transmit buffer empty
-			output_speaker[i] = sample;
-			output_tx[i] = 0;
-		}
+		if (r->mode == MODE_AM)
+			for (i= 0; i < MAX_BINS/2; i++){
+				int32_t sample;
+				sample = cabs(r->fft_time[i+(MAX_BINS/2)]);
+				//keep transmit buffer empty
+				output_speaker[i] = sample;
+				output_tx[i] = 0;
+			}
+		else
+			for (i= 0; i < MAX_BINS/2; i++){
+				int32_t sample;
+				sample = cimag(r->fft_time[i+(MAX_BINS/2)]);
+				//keep transmit buffer empty
+				output_speaker[i] = sample;
+				output_tx[i] = 0;
+			}
 
 		//push the samples to the remote audio queue, decimated to 16000 samples/sec
 		for (i = 0; i < MAX_BINS/2; i += 6)
@@ -687,7 +822,6 @@ void read_power(){
 	fwdpower = (fwdvoltage * fwdvoltage)/400;
 
 	int rf_v_p2p = (fwdvoltage * 126)/400;
-//	printf("rf volts: %d, alc %g, %d watts ", rf_v_p2p, alc_level, fwdpower/10);	
 	if (rf_v_p2p > 135 && !in_calibration){
 		alc_level *= 135.0 / (1.0 * rf_v_p2p);
 		printf("ALC tripped, to %d percent\n", (int)(100 * alc_level));
@@ -708,7 +842,7 @@ void tx_process(
 	int n_samples)
 {
 	int i;
-	double i_sample, q_sample;
+	double i_sample, q_sample, i_carrier;
 
 	struct rx *r = tx_list;
 
@@ -718,7 +852,8 @@ void tx_process(
 		tx_process_restart = 0;
 	} 
 
-	if (mute_count && (r->mode == MODE_USB || r->mode == MODE_LSB)){
+	if (mute_count && (r->mode == MODE_USB || r->mode == MODE_LSB 
+		|| r->mode == MODE_AM)){
 		memset(input_mic, 0, n_samples * sizeof(int32_t));
 		mute_count--;
 	}
@@ -735,44 +870,46 @@ void tx_process(
 
 		if (r->mode == MODE_2TONE)
 			i_sample = (1.0 * (vfo_read(&tone_a) 
-										+ vfo_read(&tone_b))) / 50000000000.0;
+										+ vfo_read(&tone_b) )) / 50000000000.0;
 		else if (r->mode == MODE_CALIBRATE)
-			i_sample = (1.0 * (vfo_read(&tone_a))) / 25000000000.0;
+			i_sample = (1.0 * (vfo_read(&tone_a))) / 30000000000.0;
 		else if (r->mode == MODE_CW || r->mode == MODE_CWR || r->mode == MODE_FT8)
 			i_sample = modem_next_sample(r->mode) / 3;
-		else {
-	  	i_sample = (1.0 * input_mic[j]) / 2000000000.0;
+		else if (r->mode == MODE_AM){
+			//double modulation = (1.0 * vfo_read(&tone_a)) / 1073741824.0;
+	  		double modulation = (1.0 * input_mic[j]) / 200000000.0;
+			if (modulation < -1.0)
+				modulation = -1.0;
+			i_carrier= (1.0  * vfo_read(&am_carrier))/ 50000000000.0 ; 
+	  		i_sample =  (1.0 + modulation) * i_carrier;
 		}
+		else 
+	  		i_sample = (1.0 * input_mic[j]) / 2000000000.0;
+		
 		//clip the overdrive to prevent damage up the processing chain, PA
-		if (r->mode == MODE_USB || r->mode == MODE_LSB){
+		if (r->mode == MODE_USB || r->mode == MODE_LSB || r->mode == MODE_AM){
 			if (i_sample < (-1.0 * voice_clip_level))
 				i_sample = -1.0 * voice_clip_level;
 			else if (i_sample > voice_clip_level)
 				i_sample = voice_clip_level;
 		}
-/*
-		//to measure the voice peaks, used to measure voice_clip_level 
-		if (max < i_sample)
-			max = i_sample;
-		if (min > i_sample)
-			min = i_sample;
-*/
+
 		//don't echo the voice modes
 		if (r->mode == MODE_USB || r->mode == MODE_LSB || r->mode == MODE_AM 
 			|| r->mode == MODE_NBFM)
 			output_speaker[j] = 0;
 		else
 			output_speaker[j] = i_sample * sidetone;
-	  q_sample = 0;
+	  	q_sample = 0;
 
-	  j++;
+	  	j++;
 
-	  __real__ fft_m[m] = i_sample;
-	  __imag__ fft_m[m] = q_sample;
+	  	__real__ fft_m[m] = i_sample;
+	  	__imag__ fft_m[m] = q_sample;
 
-	  __real__ fft_in[i]  = i_sample;
-	  __imag__ fft_in[i]  = q_sample;
-	  m++;
+	  	__real__ fft_in[i]  = i_sample;
+	  	__imag__ fft_in[i]  = q_sample;
+	  	m++;
 	}
 
 	//push the samples to the remote audio queue, decimated to 16000 samples/sec
@@ -802,7 +939,7 @@ void tx_process(
 			__real__ fft_out[i] = 0;
 			__imag__ fft_out[i] = 0;	
 		}
-	else
+	else if (r->mode != MODE_AM)
 		// zero out the USB
 		for (i = MAX_BINS/2; i < MAX_BINS; i++){
 			__real__ fft_out[i] = 0;
@@ -810,8 +947,12 @@ void tx_process(
 		}
 
 	//now rotate to the tx_bin 
+	//rememeber the AM is already a carrier modulated at 24 KHz
+	int shift = tx_shift;
+	if (r->mode == MODE_AM)
+		shift = 0;
 	for (i = 0; i < MAX_BINS; i++){
-		int b = i + tx_shift;
+		int b = i + shift;
 		if (b >= MAX_BINS)
 			b = b - MAX_BINS;
 		if (b < 0)
@@ -854,24 +995,31 @@ void sound_process(
 	if (in_tx)
 		tx_process(input_rx, input_mic, output_speaker, output_tx, n_samples);
 	else
-		rx_process(input_rx, input_mic, output_speaker, output_tx, n_samples);
-
+			rx_linear(input_rx, input_mic, output_speaker, output_tx, n_samples);
 	if (pf_record)
 		wav_record(in_tx == 0 ? output_speaker : input_mic, n_samples);
 }
 
 
 void set_rx_filter(){
-	if(rx_list->mode == MODE_LSB || rx_list->mode == MODE_CWR)
-    filter_tune(rx_list->filter, 
-      (1.0 * -rx_list->high_hz)/96000.0, 
-      (1.0 * -rx_list->low_hz)/96000.0 , 
-      5);
+	//on AM filter at the IF level, instead of the baseband
+	if (rx_list->mode == MODE_AM){
+		printf("Setting AM filter\n");
+   		filter_tune(rx_list->filter, 
+      		(1.0 * (24000 - rx_list->high_hz))/96000.0 , 
+      		(1.0 * (24000 + rx_list->high_hz))/96000.0 , 
+      	5);
+	}
+	else if(rx_list->mode == MODE_LSB || rx_list->mode == MODE_CWR)
+    		filter_tune(rx_list->filter, 
+      		(1.0 * -rx_list->high_hz)/96000.0, 
+      		(1.0 * -rx_list->low_hz)/96000.0 , 
+      	5);
 	else
-    filter_tune(rx_list->filter, 
-      (1.0 * rx_list->low_hz)/96000.0, 
-      (1.0 * rx_list->high_hz)/96000.0 , 
-      5);
+		filter_tune(rx_list->filter, 
+		(1.0 * rx_list->low_hz)/96000.0, 
+		(1.0 * rx_list->high_hz)/96000.0 , 
+     		 5);
 }
 
 /* 
@@ -923,7 +1071,6 @@ static int hw_settings_handler(void* user, const char* section,
 {
   char cmd[1000];
   char new_value[200];
-		
 
 	if (!strcmp(name, "f_start"))
 		band_power[hw_init_index].f_start = atoi(value);
@@ -934,6 +1081,8 @@ static int hw_settings_handler(void* user, const char* section,
 
 	if (!strcmp(name, "bfo_freq"))
 		bfo_freq = atoi(value);
+	if (!strcmp(name, "si570_xtal"))
+		si570_xtal = atoi(value);
 }
 
 static void read_hw_ini(){
@@ -1195,6 +1344,8 @@ void setup(){
 
 	read_hw_ini();
 
+	//create_mcast_socket();
+
 	//setup the LPF and the gpio pins
 	pinMode(TX_LINE, OUTPUT);
 	pinMode(TX_POWER, OUTPUT);
@@ -1236,9 +1387,10 @@ void setup(){
 
 	vfo_start(&tone_a, 700, 0);
 	vfo_start(&tone_b, 1900, 0);
+	vfo_start(&am_carrier, 24000, 0);
 
 	delay(2000);	
-
+//	pf_debug = fopen("am_test.raw", "w");	
 }
 
 void sdr_request(char *request, char *response){
@@ -1275,15 +1427,13 @@ void sdr_request(char *request, char *response){
 			rx_list->mode = MODE_2TONE;
 		else if (!strcmp(value, "FT8"))
 			rx_list->mode = MODE_FT8;
-		else if (!strcmp(value, "PSK31"))
-			rx_list->mode = MODE_PSK31;
-		else if (!strcmp(value, "RTTY"))
-			rx_list->mode = MODE_RTTY;
+		else if (!strcmp(value, "AM"))
+			rx_list->mode = MODE_AM;
 		else
 			rx_list->mode = MODE_USB;
 		
-    //set the tx mode to that of the rx1
-    tx_list->mode = rx_list->mode;
+    		//set the tx mode to that of the rx1
+    		tx_list->mode = rx_list->mode;
 
 		// An interesting but non-essential note:
 		// the sidebands inverted twice, to come out correctly after all
@@ -1295,12 +1445,19 @@ void sdr_request(char *request, char *response){
 		// converts to a second IF of 26.999 - 27.025 = 26 KHz
 		// Effectively, if a signal moves up, so does the second IF
 
-		if (rx_list->mode == MODE_LSB || rx_list->mode == MODE_CWR){
-			filter_tune(rx_list->filter, 
-				(1.0 * -3000)/96000.0, 
-				(1.0 * -300)/96000.0 , 
+		if (rx_list->mode == MODE_AM){
+			puts("\n\n\ntx am filter ");
+			filter_tune(tx_list->filter, 
+				(1.0 * 20000)/96000.0, 
+				(1.0 * 30000)/96000.0 , 
 				5);
-			//puts("\n\n\ntx filter ");
+			filter_tune(tx_filter, 
+				(1.0 * 20000)/96000.0, 
+				(1.0 * 30000)/96000.0 , 
+				5);
+		}
+		else if (rx_list->mode == MODE_LSB || rx_list->mode == MODE_CWR){
+			puts("\n\n\ntx LSB filter ");
 			filter_tune(tx_list->filter, 
 				(1.0 * -3000)/96000.0, 
 				(1.0 * -300)/96000.0 , 
@@ -1311,10 +1468,7 @@ void sdr_request(char *request, char *response){
 				5);
 		}
 		else { 
-			filter_tune(rx_list->filter, 
-				(1.0 * 300)/96000.0, 
-				(1.0 * 3000)/96000.0 , 
-				5);
+			puts("\n\n\ntx USB filter ");
 			filter_tune(tx_list->filter, 
 				(1.0 * 300)/96000.0, 
 				(1.0 * 3000)/96000.0 , 

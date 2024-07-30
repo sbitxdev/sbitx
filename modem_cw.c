@@ -89,6 +89,7 @@
 #include "sdr.h"
 #include "sdr_ui.h"
 #include "modem_cw.h"
+#include "sound.h"
 
 
 struct morse_tx {
@@ -315,7 +316,7 @@ static int cw_read_key(){
 	//preferance to the keyer activity
 	if (cw_key_state != CW_IDLE) {
 		//return cw_key_state;
-		cw_key_state = key_poll();
+		//cw_key_state = key_poll();
 		return cw_key_state;
 	}
 
@@ -354,9 +355,9 @@ float cw_tx_get_sample(){
 
 	// for now, updatw time and cw pitch
 	if (!keydown_count && !keyup_count){
-		millis_now = millis();
+		millis_now = sbitx_millis();
 		if (cw_tone.freq_hz != get_pitch())
-			(&cw_tone, get_pitch(), 0);
+			vfo_start(&cw_tone, get_pitch(), 0);
 	}
 
 	uint8_t symbol_now = cw_read_key();

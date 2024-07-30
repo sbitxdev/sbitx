@@ -494,6 +494,8 @@ static int sbitx_ft8_decode(float *signal, int num_samples, bool is_ft8)
 					}
 					else 
 						write_console(FONT_FT8_RX, buff);
+
+	//				save_message('R', cand->score, cand-snr,freq_hz, message.text);
 					n_decodes++;
         }
     }
